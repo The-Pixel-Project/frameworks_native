@@ -657,8 +657,10 @@ void SurfaceFlinger::enableHalVirtualDisplays(bool enable) {
 }
 
 VirtualDisplayId SurfaceFlinger::acquireVirtualDisplay(ui::Size resolution,
-                                                       ui::PixelFormat format) {
-    if (auto& generator = mVirtualDisplayIdGenerators.hal) {
+                                                       ui::PixelFormat format,
+                                                       bool canAllocateHwcForVDS) {
+    auto& generator = mVirtualDisplayIdGenerators.hal;
+    if (canAllocateHwcForVDS && generator) {
         if (const auto id = generator->generateId()) {
             if (getHwComposer().allocateVirtualDisplay(*id, resolution, &format)) {
                 return *id;
@@ -867,9 +869,9 @@ void SurfaceFlinger::init() FTL_FAKE_GUARD(kMainThreadContext) {
 
     enableLatchUnsignaledConfig = getLatchUnsignaledConfig();
 
-    if (base::GetBoolProperty("debug.sf.enable_hwc_vds"s, false)) {
-        enableHalVirtualDisplays(true);
-    }
+    mAllowHwcForWFD = base::GetBoolProperty("vendor.display.vds_allow_hwc"s, false);
+    mAllowHwcForVDS = mAllowHwcForWFD && base::GetBoolProperty("debug.sf.enable_hwc_vds"s, false);
+    mFirstApiLevel = android::base::GetIntProperty("ro.product.first_api_level", 0);
 
     // Process hotplug for displays connected at boot.
     LOG_ALWAYS_FATAL_IF(!configureLocked(),
@@ -3605,20 +3607,18 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
         status = state.surface->query(NATIVE_WINDOW_FORMAT, &format);
         ALOGE_IF(status != NO_ERROR, "Unable to query format (%d)", status);
         pixelFormat = static_cast<ui::PixelFormat>(format);
-        if (mUseHwcVirtualDisplays || getHwComposer().isUsingVrComposer()) {
-            if (maxVirtualDisplaySize == 0 ||
-                ((uint64_t)width <= maxVirtualDisplaySize &&
-                (uint64_t)height <= maxVirtualDisplaySize)) {
-                uint64_t usage = 0;
-                // Replace with native_window_get_consumer_usage ?
-                status = state .surface->getConsumerUsage(&usage);
-                ALOGW_IF(status != NO_ERROR, "Unable to query usage (%d)", status);
-                if ((status == NO_ERROR) && canAllocateHwcDisplayIdForVDS(usage)) {
-                   canAllocateHwcForVDS = true;
-               }
+        // Check if VDS is allowed to use HWC
+        size_t maxVirtualDisplaySize = getHwComposer().getMaxVirtualDisplayDimension();
+        if (maxVirtualDisplaySize == 0 || ((uint64_t)resolution.width <= maxVirtualDisplaySize &&
+            (uint64_t)resolution.height <= maxVirtualDisplaySize)) {
+            uint64_t usage = 0;
+            // Replace with native_window_get_consumer_usage ?
+            status = state .surface->getConsumerUsage(&usage);
+            ALOGW_IF(status != NO_ERROR, "Unable to query usage (%d)", status);
+            if ((status == NO_ERROR) && canAllocateHwcDisplayIdForVDS(usage)) {
+                canAllocateHwcForVDS = true;
             }
         }
-
     } else {
         // Virtual displays without a surface are dormant:
         // they have external state (layer stack, projection,
@@ -3630,7 +3630,7 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
     if (const auto& physical = state.physical) {
         builder.setId(physical->id);
     } else {
-        builder.setId(acquireVirtualDisplay(resolution, pixelFormat));
+        builder.setId(acquireVirtualDisplay(resolution, pixelFormat, canAllocateHwcForVDS));
     }
 
     builder.setPixels(resolution);
@@ -8421,15 +8421,24 @@ gui::DisplayModeSpecs::RefreshRateRanges translate(const FpsRanges& ranges) {
 bool SurfaceFlinger::canAllocateHwcDisplayIdForVDS(uint64_t usage) {
     uint64_t flag_mask_pvt_wfd = ~0;
     uint64_t flag_mask_hw_video = ~0;
-    char value[PROPERTY_VALUE_MAX] = {};
-    property_get("vendor.display.vds_allow_hwc", value, "0");
-    int allowHwcForVDS = atoi(value);
     // Reserve hardware acceleration for WFD use-case
     // GRALLOC_USAGE_PRIVATE_WFD + GRALLOC_USAGE_HW_VIDEO_ENCODER = WFD using HW composer.
     flag_mask_pvt_wfd = GRALLOC_USAGE_PRIVATE_WFD;
     flag_mask_hw_video = GRALLOC_USAGE_HW_VIDEO_ENCODER;
-    return (allowHwcForVDS || ((usage & flag_mask_pvt_wfd) &&
-            (usage & flag_mask_hw_video)));
+    bool isWfd = (usage & flag_mask_pvt_wfd) && (usage & flag_mask_hw_video);
+    // Enabling only the vendor property would allow WFD to use HWC
+    // Enabling both the aosp and vendor properties would allow all other VDS to use HWC
+    // Disabling both would set all virtual displays to fall back to GPU
+    // In vendor frozen targets, allow WFD to use HWC without any property settings.
+    bool canAllocate = mAllowHwcForVDS || (isWfd && mAllowHwcForWFD) || (isWfd &&
+                       mFirstApiLevel < __ANDROID_API_T__);
+
+    if (canAllocate) {
+        enableHalVirtualDisplays(true);
+    }
+
+    return canAllocate;
+
 }
 
 status_t SurfaceFlinger::setDesiredDisplayModeSpecs(const sp<IBinder>& displayToken,

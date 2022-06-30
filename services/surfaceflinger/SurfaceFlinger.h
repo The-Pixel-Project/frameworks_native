@@ -1096,7 +1096,8 @@ private:
     void enableHalVirtualDisplays(bool);
 
     // Virtual display lifecycle for ID generation and HAL allocation.
-    VirtualDisplayId acquireVirtualDisplay(ui::Size, ui::PixelFormat) REQUIRES(mStateLock);
+    VirtualDisplayId acquireVirtualDisplay(ui::Size, ui::PixelFormat, bool canAllocateHwcForVDS)
+            REQUIRES(mStateLock);
     void releaseVirtualDisplay(VirtualDisplayId);
 
     // Returns a display other than `mActiveDisplayId` that can be activated, if any.
@@ -1459,6 +1460,10 @@ private:
             bool childrenOnly, const std::optional<FloatRect>& optionalParentCrop);
 
     const sp<WindowInfosListenerInvoker> mWindowInfosListenerInvoker;
+
+    bool mAllowHwcForVDS = false;
+    bool mAllowHwcForWFD = false;
+    int mFirstApiLevel = 0;
 
     // returns the framerate of the layer with the given sequence ID
     float getLayerFramerate(nsecs_t now, int32_t id) const {
