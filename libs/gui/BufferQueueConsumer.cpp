@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+#include <inttypes.h>
+#include <pwd.h>
+#include <sys/types.h>
+
 #define LOG_TAG "BufferQueueConsumer"
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 //#define LOG_NDEBUG 0
@@ -41,13 +45,6 @@
 #endif
 
 #include <system/window.h>
-
-#include <com_android_graphics_libgui_flags.h>
-
-#include <inttypes.h>
-#include <pwd.h>
-#include <sys/types.h>
-#include <optional>
 
 namespace android {
 
@@ -342,9 +339,9 @@ status_t BufferQueueConsumer::detachBuffer(int slot) {
             return BAD_VALUE;
         }
 
-        const int totalSlotCount = mCore->getTotalSlotCountLocked();
-        if (slot < 0 || slot >= totalSlotCount) {
-            BQ_LOGE("detachBuffer: slot index %d out of range [0, %d)", slot, totalSlotCount);
+        if (slot < 0 || slot >= BufferQueueDefs::NUM_BUFFER_SLOTS) {
+            BQ_LOGE("detachBuffer: slot index %d out of range [0, %d)",
+                    slot, BufferQueueDefs::NUM_BUFFER_SLOTS);
             return BAD_VALUE;
         } else if (!mSlots[slot].mBufferState.isAcquired()) {
             BQ_LOGE("detachBuffer: slot %d is not owned by the consumer "
@@ -386,129 +383,120 @@ status_t BufferQueueConsumer::attachBuffer(int* outSlot,
         return BAD_VALUE;
     }
 
-    sp<IProducerListener> listener;
-    {
-        std::lock_guard<std::mutex> lock(mCore->mMutex);
+    std::lock_guard<std::mutex> lock(mCore->mMutex);
 
-        if (mCore->mSharedBufferMode) {
-            BQ_LOGE("attachBuffer: cannot attach a buffer in shared buffer mode");
-            return BAD_VALUE;
-        }
-
-        // Make sure we don't have too many acquired buffers
-        int numAcquiredBuffers = 0;
-        for (int s : mCore->mActiveBuffers) {
-            if (mSlots[s].mBufferState.isAcquired()) {
-                ++numAcquiredBuffers;
-            }
-        }
-
-        if (numAcquiredBuffers >= mCore->mMaxAcquiredBufferCount + 1) {
-            BQ_LOGE("attachBuffer: max acquired buffer count reached: %d "
-                    "(max %d)", numAcquiredBuffers,
-                    mCore->mMaxAcquiredBufferCount);
-            return INVALID_OPERATION;
-        }
-
-        if (buffer->getGenerationNumber() != mCore->mGenerationNumber) {
-            BQ_LOGE("attachBuffer: generation number mismatch [buffer %u] "
-                    "[queue %u]", buffer->getGenerationNumber(),
-                    mCore->mGenerationNumber);
-            return BAD_VALUE;
-        }
-
-        // Find a free slot to put the buffer into
-        int found = BufferQueueCore::INVALID_BUFFER_SLOT;
-        if (!mCore->mFreeSlots.empty()) {
-            auto slot = mCore->mFreeSlots.begin();
-            found = *slot;
-            mCore->mFreeSlots.erase(slot);
-        } else if (!mCore->mFreeBuffers.empty()) {
-            found = mCore->mFreeBuffers.front();
-            mCore->mFreeBuffers.remove(found);
-        }
-        if (found == BufferQueueCore::INVALID_BUFFER_SLOT) {
-            BQ_LOGE("attachBuffer: could not find free buffer slot");
-            return NO_MEMORY;
-        }
-
-#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_CONSUMER_ATTACH_CALLBACK)
-        if (mCore->mBufferAttachedCbEnabled) {
-            listener = mCore->mConnectedProducerListener;
-        }
-#endif
-
-        mCore->mActiveBuffers.insert(found);
-        *outSlot = found;
-        ATRACE_BUFFER_INDEX(*outSlot);
-        BQ_LOGV("attachBuffer: returning slot %d", *outSlot);
-
-        mSlots[*outSlot].mGraphicBuffer = buffer;
-        mSlots[*outSlot].mBufferState.attachConsumer();
-        mSlots[*outSlot].mNeedsReallocation = true;
-        mSlots[*outSlot].mFence = Fence::NO_FENCE;
-        mSlots[*outSlot].mFrameNumber = 0;
-
-        // mAcquireCalled tells BufferQueue that it doesn't need to send a valid
-        // GraphicBuffer pointer on the next acquireBuffer call, which decreases
-        // Binder traffic by not un/flattening the GraphicBuffer. However, it
-        // requires that the consumer maintain a cached copy of the slot <--> buffer
-        // mappings, which is why the consumer doesn't need the valid pointer on
-        // acquire.
-        //
-        // The StreamSplitter is one of the primary users of the attach/detach
-        // logic, and while it is running, all buffers it acquires are immediately
-        // detached, and all buffers it eventually releases are ones that were
-        // attached (as opposed to having been obtained from acquireBuffer), so it
-        // doesn't make sense to maintain the slot/buffer mappings, which would
-        // become invalid for every buffer during detach/attach. By setting this to
-        // false, the valid GraphicBuffer pointer will always be sent with acquire
-        // for attached buffers.
-        mSlots[*outSlot].mAcquireCalled = false;
-
-        VALIDATE_CONSISTENCY();
+    if (mCore->mSharedBufferMode) {
+        BQ_LOGE("attachBuffer: cannot attach a buffer in shared buffer mode");
+        return BAD_VALUE;
     }
 
-#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_CONSUMER_ATTACH_CALLBACK)
-    if (listener != nullptr) {
-        listener->onBufferAttached();
+    // Make sure we don't have too many acquired buffers
+    int numAcquiredBuffers = 0;
+    for (int s : mCore->mActiveBuffers) {
+        if (mSlots[s].mBufferState.isAcquired()) {
+            ++numAcquiredBuffers;
+        }
     }
-#endif
+
+    if (numAcquiredBuffers >= mCore->mMaxAcquiredBufferCount + 1) {
+        BQ_LOGE("attachBuffer: max acquired buffer count reached: %d "
+                "(max %d)", numAcquiredBuffers,
+                mCore->mMaxAcquiredBufferCount);
+        return INVALID_OPERATION;
+    }
+
+    if (buffer->getGenerationNumber() != mCore->mGenerationNumber) {
+        BQ_LOGE("attachBuffer: generation number mismatch [buffer %u] "
+                "[queue %u]", buffer->getGenerationNumber(),
+                mCore->mGenerationNumber);
+        return BAD_VALUE;
+    }
+
+    // Find a free slot to put the buffer into
+    int found = BufferQueueCore::INVALID_BUFFER_SLOT;
+    if (!mCore->mFreeSlots.empty()) {
+        auto slot = mCore->mFreeSlots.begin();
+        found = *slot;
+        mCore->mFreeSlots.erase(slot);
+    } else if (!mCore->mFreeBuffers.empty()) {
+        found = mCore->mFreeBuffers.front();
+        mCore->mFreeBuffers.remove(found);
+    }
+    if (found == BufferQueueCore::INVALID_BUFFER_SLOT) {
+        BQ_LOGE("attachBuffer: could not find free buffer slot");
+        return NO_MEMORY;
+    }
+
+    mCore->mActiveBuffers.insert(found);
+    *outSlot = found;
+    ATRACE_BUFFER_INDEX(*outSlot);
+    BQ_LOGV("attachBuffer: returning slot %d", *outSlot);
+
+    mSlots[*outSlot].mGraphicBuffer = buffer;
+    mSlots[*outSlot].mBufferState.attachConsumer();
+    mSlots[*outSlot].mNeedsReallocation = true;
+    mSlots[*outSlot].mFence = Fence::NO_FENCE;
+    mSlots[*outSlot].mFrameNumber = 0;
+
+    // mAcquireCalled tells BufferQueue that it doesn't need to send a valid
+    // GraphicBuffer pointer on the next acquireBuffer call, which decreases
+    // Binder traffic by not un/flattening the GraphicBuffer. However, it
+    // requires that the consumer maintain a cached copy of the slot <--> buffer
+    // mappings, which is why the consumer doesn't need the valid pointer on
+    // acquire.
+    //
+    // The StreamSplitter is one of the primary users of the attach/detach
+    // logic, and while it is running, all buffers it acquires are immediately
+    // detached, and all buffers it eventually releases are ones that were
+    // attached (as opposed to having been obtained from acquireBuffer), so it
+    // doesn't make sense to maintain the slot/buffer mappings, which would
+    // become invalid for every buffer during detach/attach. By setting this to
+    // false, the valid GraphicBuffer pointer will always be sent with acquire
+    // for attached buffers.
+    mSlots[*outSlot].mAcquireCalled = false;
+
+    VALIDATE_CONSISTENCY();
 
     return NO_ERROR;
 }
 
-#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_GL_FENCE_CLEANUP)
-status_t BufferQueueConsumer::releaseBuffer(int slot, uint64_t frameNumber,
-                                            const sp<Fence>& releaseFence) {
-#else
 status_t BufferQueueConsumer::releaseBuffer(int slot, uint64_t frameNumber,
         const sp<Fence>& releaseFence, EGLDisplay eglDisplay,
         EGLSyncKHR eglFence) {
-#endif
     ATRACE_CALL();
     ATRACE_BUFFER_INDEX(slot);
 
-    const int totalSlotCount = mCore->getTotalSlotCountLocked();
-    if (slot < 0 || slot >= totalSlotCount) {
-        BQ_LOGE("releaseBuffer: slot index %d out of range [0, %d)", slot, totalSlotCount);
+    if (slot < 0 || slot >= BufferQueueDefs::NUM_BUFFER_SLOTS ||
+            releaseFence == nullptr) {
+        BQ_LOGE("releaseBuffer: slot %d out of range or fence %p NULL", slot,
+                releaseFence.get());
         return BAD_VALUE;
     }
-    if (releaseFence == nullptr) {
-        BQ_LOGE("releaseBuffer: slot %d fence %p NULL", slot, releaseFence.get());
-        return BAD_VALUE;
+
+#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_GL_FENCE_CLEANUP)
+    if (eglFence != EGL_NO_SYNC_KHR) {
+        // Most platforms will be using native fences, so it's unlikely that we'll ever have to
+        // process an eglFence. Ideally we can remove this code eventually. In the mean time, do our
+        // best to wait for it so the buffer stays valid, otherwise return an error to the caller.
+        //
+        // EGL_SYNC_FLUSH_COMMANDS_BIT_KHR so that we don't wait forever on a fence that hasn't
+        // shown up on the GPU yet.
+        EGLint result = eglClientWaitSyncKHR(eglDisplay, eglFence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR,
+                                             1000000000);
+        if (result == EGL_FALSE) {
+            BQ_LOGE("releaseBuffer: error %#x waiting for fence", eglGetError());
+            return UNKNOWN_ERROR;
+        } else if (result == EGL_TIMEOUT_EXPIRED_KHR) {
+            BQ_LOGE("releaseBuffer: timeout waiting for fence");
+            return UNKNOWN_ERROR;
+        }
+        eglDestroySyncKHR(eglDisplay, eglFence);
     }
+#endif
 
     sp<IProducerListener> listener;
     { // Autolock scope
         std::lock_guard<std::mutex> lock(mCore->mMutex);
-
-        const int totalSlotCount = mCore->getTotalSlotCountLocked();
-        if (slot < 0 || slot >= totalSlotCount || releaseFence == nullptr) {
-            BQ_LOGE("releaseBuffer: slot %d out of range [0, %d) or fence %p NULL", slot,
-                    totalSlotCount, releaseFence.get());
-            return BAD_VALUE;
-        }
 
         // If the frame number has changed because the buffer has been reallocated,
         // we can ignore this releaseBuffer for the old buffer.
@@ -656,43 +644,6 @@ status_t BufferQueueConsumer::getReleasedBuffers(uint64_t *outSlotMask) {
     return NO_ERROR;
 }
 
-#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_UNLIMITED_SLOTS)
-status_t BufferQueueConsumer::getReleasedBuffersExtended(std::vector<bool>* outSlotMask) {
-    ATRACE_CALL();
-
-    if (outSlotMask == nullptr) {
-        BQ_LOGE("getReleasedBuffersExtended: outSlotMask may not be NULL");
-        return BAD_VALUE;
-    }
-
-    std::lock_guard<std::mutex> lock(mCore->mMutex);
-
-    if (mCore->mIsAbandoned) {
-        BQ_LOGE("getReleasedBuffersExtended: BufferQueue has been abandoned");
-        return NO_INIT;
-    }
-
-    const int totalSlotCount = mCore->getTotalSlotCountLocked();
-    outSlotMask->resize(totalSlotCount);
-    for (int s = 0; s < totalSlotCount; ++s) {
-        (*outSlotMask)[s] = !mSlots[s].mAcquireCalled;
-    }
-
-    // Remove from the mask queued buffers for which acquire has been called,
-    // since the consumer will not receive their buffer addresses and so must
-    // retain their cached information
-    BufferQueueCore::Fifo::iterator current(mCore->mQueue.begin());
-    while (current != mCore->mQueue.end()) {
-        if (current->mAcquireCalled) {
-            (*outSlotMask)[current->mSlot] = false;
-        }
-        ++current;
-    }
-
-    return NO_ERROR;
-}
-#endif
-
 status_t BufferQueueConsumer::setDefaultBufferSize(uint32_t width,
         uint32_t height) {
     ATRACE_CALL();
@@ -710,28 +661,6 @@ status_t BufferQueueConsumer::setDefaultBufferSize(uint32_t width,
     mCore->mDefaultHeight = height;
     return NO_ERROR;
 }
-
-#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_UNLIMITED_SLOTS)
-status_t BufferQueueConsumer::allowUnlimitedSlots(bool allowUnlimitedSlots) {
-    ATRACE_CALL();
-    BQ_LOGV("allowUnlimitedSlots: %d", allowUnlimitedSlots);
-    std::lock_guard<std::mutex> lock(mCore->mMutex);
-
-    if (mCore->mIsAbandoned) {
-        BQ_LOGE("allowUnlimitedSlots: BufferQueue has been abandoned");
-        return NO_INIT;
-    }
-
-    if (mCore->mConnectedApi != BufferQueueCore::NO_CONNECTED_API) {
-        BQ_LOGE("allowUnlimitedSlots: BufferQueue already connected");
-        return INVALID_OPERATION;
-    }
-
-    mCore->mAllowExtendedSlotCount = allowUnlimitedSlots;
-
-    return OK;
-}
-#endif // COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_UNLIMITED_SLOTS)
 
 status_t BufferQueueConsumer::setMaxBufferCount(int bufferCount) {
     ATRACE_CALL();
@@ -768,31 +697,20 @@ status_t BufferQueueConsumer::setMaxBufferCount(int bufferCount) {
     return NO_ERROR;
 }
 
-status_t BufferQueueConsumer::setMaxAcquiredBufferCount(int maxAcquiredBuffers) {
-    return setMaxAcquiredBufferCount(maxAcquiredBuffers, std::nullopt);
-}
-
 status_t BufferQueueConsumer::setMaxAcquiredBufferCount(
-        int maxAcquiredBuffers, std::optional<OnBufferReleasedCallback> onBuffersReleasedCallback) {
+        int maxAcquiredBuffers) {
     ATRACE_FORMAT("%s(%d)", __func__, maxAcquiredBuffers);
 
-    std::optional<OnBufferReleasedCallback> callback;
+    if (maxAcquiredBuffers < 1 ||
+            maxAcquiredBuffers > BufferQueueCore::MAX_MAX_ACQUIRED_BUFFERS) {
+        BQ_LOGE("setMaxAcquiredBufferCount: invalid count %d",
+                maxAcquiredBuffers);
+        return BAD_VALUE;
+    }
+
+    sp<IConsumerListener> listener;
     { // Autolock scope
         std::unique_lock<std::mutex> lock(mCore->mMutex);
-
-        // We reserve two slots in order to guarantee that the producer and
-        // consumer can run asynchronously.
-        int maxMaxAcquiredBuffers =
-#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(WB_UNLIMITED_SLOTS)
-                mCore->getTotalSlotCountLocked() - 2;
-#else
-                BufferQueueCore::MAX_MAX_ACQUIRED_BUFFERS;
-#endif
-        if (maxAcquiredBuffers < 1 || maxAcquiredBuffers > maxMaxAcquiredBuffers) {
-            BQ_LOGE("setMaxAcquiredBufferCount: invalid count %d", maxAcquiredBuffers);
-            return BAD_VALUE;
-        }
-
         mCore->waitWhileAllocatingLocked(lock);
 
         if (mCore->mIsAbandoned) {
@@ -838,20 +756,13 @@ status_t BufferQueueConsumer::setMaxAcquiredBufferCount(
         BQ_LOGV("setMaxAcquiredBufferCount: %d", maxAcquiredBuffers);
         mCore->mMaxAcquiredBufferCount = maxAcquiredBuffers;
         VALIDATE_CONSISTENCY();
-        if (delta < 0) {
-            if (onBuffersReleasedCallback) {
-                callback = std::move(onBuffersReleasedCallback);
-            } else if (mCore->mBufferReleasedCbEnabled) {
-                callback = [listener = mCore->mConsumerListener]() {
-                    listener->onBuffersReleased();
-                };
-            }
+        if (delta < 0 && mCore->mBufferReleasedCbEnabled) {
+            listener = mCore->mConsumerListener;
         }
     }
-
     // Call back without lock held
-    if (callback) {
-        (*callback)();
+    if (listener != nullptr) {
+        listener->onBuffersReleased();
     }
 
     return NO_ERROR;
