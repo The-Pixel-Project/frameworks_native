@@ -122,8 +122,10 @@ public:
                               uint32_t policyFlags) = 0;
 
     /* Poke user activity for an event dispatched to a window. */
-    virtual void pokeUserActivity(nsecs_t eventTime, int32_t eventType,
-                                  ui::LogicalDisplayId displayId) = 0;
+    void pokeUserActivity(nsecs_t eventTime, int32_t eventType, int32_t displayId) override {
+    // Convert int32_t to LogicalDisplayId and call your main implementation
+    pokeUserActivity(eventTime, eventType, ui::LogicalDisplayId(displayId));
+}
 
     /*
      * Return true if the provided event is stale, and false otherwise. Used for determining
